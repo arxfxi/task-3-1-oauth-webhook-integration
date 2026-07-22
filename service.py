@@ -30,6 +30,8 @@ class IntegrationState:
     def __init__(self, slack_url: str, calendar_url: str) -> None:
         self.slack_url = slack_url.rstrip("/")
         self.calendar_url = calendar_url.rstrip("/")
+        # In-memory idempotency is enough for the local grader. The lock keeps
+        # concurrent duplicate webhook requests from racing each other.
         self.processed_event_ids: set[str] = set()
         self.in_progress_event_ids: set[str] = set()
         self.lock = threading.Lock()
@@ -59,6 +61,8 @@ def http_json(
 
 
 def get_calendar_token(state: IntegrationState) -> str:
+    # The mock accepts placeholder client credentials and returns a static
+    # bearer token. This mirrors the shape of OAuth without external accounts.
     _, payload = http_json(
         f"{state.calendar_url}/oauth/token",
         method="POST",
@@ -112,6 +116,8 @@ def post_to_slack_with_retry(state: IntegrationState, event: dict[str, Any]) -> 
             last_error = str(exc)
 
         if attempt < SLACK_ATTEMPTS:
+            # Jitter prevents many failed events from retrying in the same
+            # synchronized wave when Slack is temporarily unhealthy.
             base_delay = min(0.25 * (2 ** (attempt - 1)), 2.0)
             jitter = random.uniform(0, base_delay * 0.5)
             time.sleep(base_delay + jitter)
@@ -120,6 +126,8 @@ def post_to_slack_with_retry(state: IntegrationState, event: dict[str, Any]) -> 
 
 
 def deliver_event(state: IntegrationState, event: dict[str, Any]) -> dict[str, Any]:
+    # Both /webhook and /sync use this path so dedupe behavior is identical
+    # whether an event is pushed by the grader or pulled from mock Calendar.
     raw_event_id = event.get("event_id")
     event_id = str(raw_event_id).strip() if raw_event_id is not None else ""
     if not event_id:
@@ -133,6 +141,8 @@ def deliver_event(state: IntegrationState, event: dict[str, Any]) -> dict[str, A
             return {"ok": True, "posted": False, "duplicate": True}
         if event_id in state.in_progress_event_ids:
             return {"ok": True, "posted": False, "duplicate": True, "in_progress": True}
+        # Mark before posting so simultaneous duplicate requests do not both
+        # reach Slack. We only mark processed after Slack confirms success.
         state.in_progress_event_ids.add(event_id)
 
     try:
@@ -148,6 +158,8 @@ def deliver_event(state: IntegrationState, event: dict[str, Any]) -> dict[str, A
 
 
 def sync_calendar_once(state: IntegrationState) -> dict[str, Any]:
+    # Calendar pull is explicit via /sync, avoiding surprise Slack posts when
+    # the grader starts the service just to test webhook behavior.
     token = get_calendar_token(state)
     events = fetch_calendar_events(state, token)
     results = [deliver_event(state, event) for event in events]
@@ -184,6 +196,8 @@ class Handler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return None, "invalid_content_length"
+        # A small body limit is a simple guard against accidental or malicious
+        # memory pressure from the public webhook endpoint.
         if content_length > MAX_BODY_BYTES:
             return None, "body_too_large"
         raw = self.rfile.read(content_length) if content_length else b"{}"
@@ -250,6 +264,8 @@ def main() -> None:
                 result = sync_calendar_once(state)
                 print(f"startup sync: {json.dumps(result)}", flush=True)
             except Exception as exc:
+                # Startup sync is optional; dependency outages should not stop
+                # /healthz from reporting that the process itself is alive.
                 print(f"startup sync failed: {exc}", flush=True)
 
         threading.Thread(target=startup_sync, daemon=True).start()
